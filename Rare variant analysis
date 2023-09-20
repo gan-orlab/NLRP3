@@ -1,1 +1,122 @@
+UKBB filtration steps:
+library(data.table)
 
+#Read table with all fields
+ukb <- as.data.frame(fread("/tabular/current.csv"))
+
+#Write field of interest
+field <- c("20002","41270","20111","20110","20107","22001","22006","22009","22000","189","34","21022","22021","22019","22027")
+
+#Change into pattern recognisable by grep
+pattern <- paste0("^",field,"-",collapse = "|")
+
+#Selct field of interest
+ukb_filtered <- ukb[,c(1,grep(pattern,names(ukb)))]
+
+#Select PD self-reported (code 1262) and ICD10 codes (G20)
+ukb_self <- ukb_filtered[,c(1,grep("^20002-",names(ukb_filtered)))]
+PD_self <- ukb_self[which(apply(ukb_self,1,function(i){any(i == 1262)})),]$eid
+ukb_ICD <- ukb_filtered[,c(1,grep("^41270-",names(ukb_filtered)))]
+PD_ICD <- ukb_ICD[which(apply(ukb_ICD,1,function(i){any(i == "G20")})),]$eid
+PD <- union(PD_self, PD_ICD)
+
+
+#Select the rest as controls
+control <- setdiff(ukb_filtered$eid,union(PD_proxy,PD))
+
+#Perform filter for samples with known issue (aneupleudy, missingness, het outlier) and relatedness (0 = no closer than 3rd degree relative) & ancestry filter (1 = causacian)
+ukb_unrelated <- readLines("~/runs/go_lab/GRCh37/ukbb/UKBB_raw_data_no_cousins.txt")
+ukb_filtered_unrelated <- ukb_filtered[ukb_filtered$eid %in% ukb_unrelated,]
+ukb_filtered_unrelated_euro <- ukb_filtered_unrelated[ukb_filtered_unrelated$"22006-0.0" %in% 1,]
+ukb_filtered_unrelated_euro_aneu <- ukb_filtered_unrelated_euro[!(ukb_filtered_unrelated_euro$"22019-0.0" %in% 1),]
+ukb_filtered_unrelated_euro_aneu_miss <- ukb_filtered_unrelated_euro_aneu[!(ukb_filtered_unrelated_euro_aneu$"22027-0.0" %in% 1),]
+
+
+###Step 1 do tabix for  UKBB files ##note, all batches for chr1 as an example.
+for N in {0..96}; do sbatch -c 1 --mem=10g -t 6:0:0 --wrap="bash ../tabix.sh ukb23156_c1_b${N}_v1.vcf.gz" ; done
+#step 2 , do GATK with GQ30 DP20 also remove multiallelic sites
+for N in {0..96}; do sbatch -c 2 --mem=15g -t 6:0:0 --wrap="vcftools --gzvcf ukb23156_c1_b${N}_v1.vcf.gz_GQ20_DP10_MISS_filtered.vcf.gz --max-alleles 2 --min-alleles 2 --recode --stdout | gzip -c > ukb23156_c1_b${N}_v1.vcf.gz_GQ20_DP10_MISS_filtered_2alleles.vcf.gz"; done
+#convert to b-files
+for N in {0..96}; do sbatch -c 2 --mem=12g -t 6:0:0 --wrap="plink --vcf ukb23156_c1_b${N}_v1.vcf.gz_GQ20_DP10_MISS_filtered_2alleles.vcf.gz   --vcf-half-call m --make-bed --out ukb23156_c1_b${N}_v1_after_GATK";done
+####convert vcf to ANNOVAR format
+for N in {0..96}; do sbatch -c 1 --mem=10g -t 8:0:0 --wrap="perl ~/runs/senkkon/annovar/convert2annovar.pl --format vcf4 ukb23156_c1_b${N}_v1.vcf.gz_GQ20_DP10_MISS_filtered_2alleles.vcf.gz --allsample --withfreq --outfile chr1_b${N}_recode_convert" ; done
+###annotate all snps
+for N in {0..96}; do sbatch -c 1 --mem=8g -t 3:0:0 --wrap="perl ~/runs/senkkon/annovar/table_annovar.pl chr22_b${N}_recode_convert /scratch/senkkon/UKBB/FILTERED/annovar/humandb/ --buildver hg38 --out annotated/chr22_b${N}_recode_convert.annovar --remove --protocol refGene,ljb26_all,dbnsfp41c --operation g,f,f --nastring ." ; done
+for N in 1; do mkdir chr${N}/annotated; done
+for N in 1; do mkdir chr${N}/annotated/all_coding; done
+for N in 1; do mkdir chr${N}/annotated/CADD; done
+for N in 1; do mkdir chr${N}/annotated/all_rare; done
+for N in 1; do mkdir chr${N}/annotated/all_functional; done
+
+####Data for AMP-PD was filtered using Terra####
+
+We than Extracted NLRP3, CASP1 and PYCARD (hg38) and performed meta-analysis between AMP_PD and UKBB cohorts.
+IL18 and IL1B contained only singular rare variants and were insufficient for the meta-analysis. 
+
+#Dara prep in brief, Prefilter WGS and WES data, extract in hg38, merge all b-files, use annovar to annotate and then prep SETID file for META-SKAT#
+#Extract rare variants from the prefiltered UKBB files#
+plink --bfile ~/scratch/beluga_scratch/UKBB/VCF_DP_Filtered/vcf_ukb_unfiltered/chr1/ukb23156_c1_b95_v1_after_GATK --chr 1 --from-bp 247416156 --to-bp 247449108 --make-bed --out ~/scratch/NEUROINF/NLRP3 --max-maf 0.01
+plink --bfile ~/scratch/beluga_scratch/UKBB/VCF_DP_Filtered/vcf_ukb_unfiltered/chr16/ukb23156_c16_b23_v1_after_GATK --chr 16 --from-bp 31201486 --to-bp 31202760 --make-bed --out ~/scratch/NEUROINF/PYCARD --max-maf 0.01
+plink --bfile ~/scratch/beluga_scratch/UKBB/VCF_DP_Filtered/vcf_ukb_unfiltered/chr11/ukb23156_c11_b44_v1_after_GATK --chr 11 --from-bp 105025508 --to-bp 105035250 --make-bed --out ~/scratch/NEUROINF/CASP1 --max-maf 0.01
+
+
+#### Use SKAT-O and Meta-SKAT for burden and kernel analyses #####
+
+wd <- getwd()
+
+packrat::init("~/runs/eyu8/library/SKAT")
+library(SKAT)
+library(MetaSKAT)
+
+
+setwd(wd)
+
+File.Meta.SKATO = "NLRP3_genes_meta_30x.results.skato"
+File.Meta.BURDEN = "NLRP3_genes_meta_30x.results.burden"
+
+File.Mat.vec<-rep("",2)
+File.SetInfo.vec<-rep("",2)
+
+i = 1
+for(cohort in c("UKBB","AMP_PD")){
+    File.Bed   = paste0("NLRP3_genes",cohort,".bed")
+    File.Bim   = paste0("NLRP3_genes",cohort,".bim")
+    File.Fam   = paste0("NLRP3_genes",cohort,".fam")
+    File.SetID   = paste0("NLRP3_genes",cohort,".SETID")
+    File.SSD = paste0("NLRP3_genes",cohort,".SSD")
+    File.Info = paste0("NLRP3_genes",cohort,".info")
+    File.Mat   = paste0("NLRP3_genes",cohort,".mat")
+    File.SetInfo  = paste0("NLRP3_genes",cohort,".MInfo")
+    File.cov = paste0("NLRP3_genes",cohort,".txt")
+    File.Results.SKATO = paste0("NLRP3_genes",cohort,".results.skato")
+    File.Results.BURDEN = paste0("NLRP3_genes",cohort,".results.burden")
+
+    Generate_SSD_SetID(File.Bed, File.Bim, File.Fam, File.SetID, File.SSD, File.Info)
+    SSD.INFO<-Open_SSD(File.SSD, File.Info)
+
+    FAM<-Read_Plink_FAM_Cov(File.Fam, File.cov, Is.binary =TRUE, cov_header=TRUE)
+    y<-(FAM$Status-1)
+    Age<-FAM$Age
+    Sex<-FAM$Sex.y
+    N.Sample<-length(y)
+    obj<-SKAT_Null_Model(y ~ Age + Sex, out_type="D")
+
+    out.skato<-SKATBinary.SSD.All(SSD.INFO, obj, method="optimal.adj")
+    out.skato.burden<-SKATBinary.SSD.All(SSD.INFO, obj, method="Burden")
+    write.table(out.skato$results, file=File.Results.SKATO, col.names = TRUE, row.names = FALSE)
+    write.table(out.skato.burden$results, file=File.Results.BURDEN, col.names = TRUE, row.names = FALSE)
+
+    re1<-Generate_Meta_Files(obj, File.Bed, File.Bim, File.SetID, File.Mat, File.SetInfo, N.Sample)
+
+    File.Mat.vec[i] <- File.Mat
+    File.SetInfo.vec[i] <- File.SetInfo
+
+    i <- i + 1
+}
+
+Cohort.Info <- Open_MSSD_File_2Read(File.Mat.vec, File.SetInfo.vec)
+
+out.skato.burden <- MetaSKAT_MSSD_ALL(Cohort.Info, method = "Burden")
+out.skato<- MetaSKAT_MSSD_ALL(Cohort.Info, method = "optimal")
+write.table(out.skato, file= File.Meta.SKATO, col.names = TRUE, row.names = FALSE)
+write.table(out.skato.burden, file= File.Meta.BURDEN, col.names = TRUE, row.names = FALSE)
